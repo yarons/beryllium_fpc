@@ -242,9 +242,10 @@ polls that property before it will use keymaster. On pmOS none of that exists:
 
 ### The fix (entirely Linux-side; ROT already set, no lk2nd change)
 1. **Kernel** — add QSEE listener support to `qcom_scm`: the register-listener call and the
-   incomplete-command continuation loop (when the TA returns `QSEOS_LISTENER_ID`, hand the request to
-   userspace and resume after the response). Wire it through the shim's existing
-   `RECEIVE_REQ`/`SEND_RESP_REQ` ioctls.
+   incomplete-command continuation loop (when the TA returns `QSEOS_LISTENER_ID`, service the request
+   and resume via `LISTENER_RESPONSE`). **Started:** [`kernel-patches/0001-qcom_scm-qseecom-listener.patch`](kernel-patches/)
+   adds the in-kernel listener framework (`qcom_scm_qseecom_listener_register()` + the service loop),
+   ported from samcday's QSEECOM TEE work. A service backend (below) fills a listener and registers it.
 2. **Userspace** — a small qseecomd-equivalent implementing the two services the TA needs at init:
    - **Secure File System (SFS)** — back it with the `storsec_a`/`storsec_b` partitions (present on this
      device: `sde10`/`sde11`).

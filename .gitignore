@@ -9,6 +9,8 @@ ref/
 downstream/
 # kernel patches: triage before publishing
 *.patch
+# except triaged, publishable kernel-patches/ (GPL, attributed, no secrets)
+!kernel-patches/*.patch
 # build/binary artifacts
 *.ko
 *.so
