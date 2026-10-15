@@ -6,6 +6,8 @@ the **Goodix Milan-F** in-display-adjacent capacitive fingerprint sensor on the
 (postmarketOS, 7.2.9-sdm845).
 
 > **Status: research / work-in-progress. There is NO working unlock yet.**
+> The reader is alive up to frame capture; the unlock is walled at the TrustZone
+> gatekeeper — see **[`UNLOCK.md`](UNLOCK.md)** for exactly where and the two paths past it.
 > This repo documents how far reverse-engineering got and is meant to save the next
 > person months of dead ends. What works and what doesn't is spelled out below.
 

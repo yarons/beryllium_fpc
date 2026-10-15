@@ -726,6 +726,164 @@ LINUX INTEGRATION (the decision): fprintd/libfprint have NO HAT/gatekeeper conce
   DRIVER TODO: an enroll mode that RE-ISSUES 1060 after each acquire + services GF_CMD_IRQ(1016) properly
   (today's single-arm probe can't loop). Or drive the loop from userspace (the libfprint driver's job).
 
+### Finding X — corrections (advisor) + UNTRUSTED enroll/auth is the no-gatekeeper path + HAL IRQ loop exact (2026-10-13)
+CORRECTIONS to Finding W (several claims were overstated):
+- 1060/1061 are NOT FRR/FAR-record. gf_cmd_map: **1060 = GF_CMD_TEST_UNTRUSTED_ENROLL, 1061 =
+  GF_CMD_TEST_UNTRUSTED_AUTHENTICATE** — enroll/match deliberately WITHOUT the trusted gatekeeper HAT.
+  This is the intended no-gatekeeper path (exactly what Linux/libfprint needs). NOT a throwaway test.
+- **1056 (the ENROLL-zeroed-HAT status) is UNDECODED.** I twice conflated the GF_CMD and GF_ERROR tables;
+  gf_cmd_map 1056=TEST_RESET_FWCFG is a DIFFERENT namespace. The GF_ERROR meaning of status 1056 is
+  unknown (candidates: INVALID_CHALLENGE / INVALID_HAT_VERSION / a state error). So "1007 verifies the HAT"
+  is UNPROVEN — it is only "1007 with a zeroed payload (after a pre_enroll) returns 1056". The crafted-HAT
+  probe (version + real pre_enroll challenge + zero HMAC) is still the way to learn which check it is, but
+  it is now LOW priority because 1060 (untrusted) is the real Linux path.
+- "TEST enroll is single-shot" was one-sample and is downgraded to a hypothesis (see BLOCKER below).
+
+HAL IRQ LOOP — exact buffer (hal_milan_f_series_irq @0x2de48, from milanf_irq.ann 2df40-2e010):
+  seeds image buffer: [0x367e1]=0x02000000, [0x367e5]=0 (8B), [0x36810]=0x200, [0x36a18]=1 (step);
+  calls gf_hal_invoke_command(cmd=0x3f8=1016, buf, len=0x36a20) ONCE (not a step-resend loop);
+  on success reads [0x36a14] (-> g_spi_speed) and dispatches on irq_type=[0x60]; the ONLY re-arm is
+  gf_hal_enable_irq (the Linux GPIO IRQ) — there is NO per-touch TA command (no camera_capture re-issue;
+  the invoke_command_ex @2e7e4 is in hal_key_long_pressed_timer_thread, cmd 1075, unrelated). The TA keeps
+  the sensor in finger-detect internally during a continuous operation. => my driver's gf_pull_irq buffer
+  already matches; the multi-resend loop is unnecessary but harmless.
+
+BLOCKER (enroll loop) — HYPOTHESES, not settled: UNTRUSTED_ENROLL(1060) returned status 0 + produced
+  exactly ONE acquire IRQ (op=34, irq_type=0x2) from ~10 taps, then DETECT drifted to 1062. The capture
+  path (1067) gives a clean single op=39/0x80 frame (nz=9504) per touch. So the sensor+pull work; what
+  fails is CONTINUOUS enroll detect. Candidates: (a) 1060 does not hold continuous detect (needs a
+  per-acquire re-issue the trusted 1007 path gets internally), (b) the sensor IRQ line stays asserted after
+  the pull (edge-triggered RISING -> no new edge until it de-asserts), (c) contact/timing on the taps.
+  DECISIVE next test (one finger session): reset gfber fresh, ginit, 1060, then 5 SLOW fully-lifted taps
+  while watching /proc/interrupts per tap — IRQ rises per tap => detect works (earlier was contact/timing);
+  flat => enroll mode isn't holding detect (try re-issuing 1060 or 1021 per acquire, or crafted-HAT 1007).
+
+THREE FRONTIERS status: (1) enroll/auth unlock = path FOUND (UNTRUSTED 1060/1061, no HAT); blocker =
+  continuous enroll detect (above). (2) libfprint/PAM = follows (1); architecture = a match-on-chip driver
+  over the TA (userspace over the shim, mirroring the vendor HAL; GNOME enroll UI + pam_fprintd unlock free).
+  (3) viewable image = calibration: op39 capture works but FPN-dominated with no base; need the calibration/
+  base command (OPERATION_TEST_BIO_CALIBRATION / FINGER_BASE / HBD_CALIBRATION; grp3 arg# still TBD) to build
+  a finger-off base, then op39-minus-base. Repo: github.com/yarons/beryllium_fpc (renamed from _mainline).
+
+### Finding Y — HAT HMAC IS verified (1056=challenge, 1057=HMAC); enroll needs gatekeeper OR host-driven untrusted loop (2026-10-13)
+Crafted-HAT probe on-device (no finger), fresh gfber+ginit+PRE_ENROLL (challenge read from gdump @0x60 =
+  88 8e 15 b5 42 d7 95 68). ENROLL(grp1/1007 len176) via gpay-staged payload:
+  zeroed HAT                          -> status 1056
+  HAT.challenge=real, HMAC=0 (@0x6a)  -> status 1057   (STATUS CHANGED)
+=> the HAT checks are SEQUENTIAL: challenge first (zeroed -> 1056), then HMAC (zero HMAC -> 1057). So the TA
+   GENUINELY VERIFIES the HAT HMAC — the trusted 1007 enroll requires a REAL gatekeeper-signed token and
+   CANNOT be forged with a zero HMAC. (Resolves Finding W/X: "1007 verifies the HAT" is now PROVEN; 1056 =
+   challenge-class error, 1057 = HMAC-class error — both are GF_ERROR codes, decoded empirically not by table.)
+UNTRUSTED ENROLL (1060) re-confirmed: 5 SLOW fully-lifted taps on a fresh gfber -> exactly ONE acquire
+  (op=34), IRQ 32->33. So 1060 does NOT hold continuous detect (not contact/timing). It fires one acquire
+  per issue; a loop must RE-ISSUE per touch (mechanism TBD: re-issue 1060? a continue cmd?).
+
+TWO PATHS TO A WORKING ENROLL (decision point):
+  A. GATEKEEPER HAT (trusted, continuous): find+load the Qualcomm "gatekeeper" TA (like keymaster/fpcber),
+     RE its enroll/verify-password -> HAT mint API, mint a HAT bound to a PIN, feed to ENROLL(1007). TA then
+     holds continuous detect, enroll completes, template stored. AUTHENTICATE(1010) matches (no HAT). Proper,
+     PIN-bound, more work. (Note: Linux fprintd has no gatekeeper concept, so the libfprint driver would mint
+     the HAT internally via the gatekeeper TA.)
+  B. UNTRUSTED host-driven loop (no gatekeeper): drive 1060 in a host loop (issue 1060 -> wait IRQ -> pull
+     1016 -> read progress -> re-issue to re-arm) to completion, then AUTHENTICATE(1010) (no HAT). Cleaner for
+     Linux IF the per-acquire re-arm works. NEXT TEST (1 touch): after the one acquire, re-issue 1060 and tap
+     -> does a 2nd acquire fire? yes => path B works, build the loop; no => try 1021/continue, else path A.
+Capture (1067) still gives a clean op39/0x80 full frame per touch (the image path is independent).
+
+### Finding Z — untrusted ops are ONE-SHOT frame acquires (no continuous op); enroll needs the gatekeeper TA, which is NOT on the device (2026-10-13) **SESSION VERDICT**
+Exhaustive on-device testing of the untrusted path:
+  - Fresh ginit arms exactly ONE finger-detect cycle. The FIRST operation command after ginit + the next tap
+    yields ONE acquire: UNTRUSTED_ENROLL(1060)->op=34, UNTRUSTED_AUTH(1061)->op=35, capture(1067)->op=39.
+  - After that one acquire, the sensor does NOT re-detect: re-issuing 1060 then tapping = NO IRQ; a 2nd/3rd/…
+    tap = NO IRQ; 5 slow fully-lifted taps = still ONE IRQ. Re-issuing the command does not re-arm.
+  - Auth armed after a fresh ginit DID produce op=35 (a match-acquire), but only one frame, no match verdict in
+    the trace words (w[0x60..0x9f] mostly 0); the verdict would come from the continuous op's later steps.
+  => The untrusted/test commands produce single one-shot frame acquires, NOT the continuous multi-frame
+     accumulate(enroll)/match(auth) operation. A real enroll (accumulate N frames + commit a template) and a
+     real match verdict require the TA to HOLD detect across touches — the TRUSTED continuous path (1007/1010).
+  => ENROLL(1007) requires a real HMAC-signed gatekeeper HAT (Finding Y: 1056 challenge -> 1057 HMAC, both
+     verified; zero HMAC rejected). So a WORKING enroll NEEDS a gatekeeper-minted HAT. No no-gatekeeper shortcut.
+GATEKEEPER TA AVAILABILITY: the pmOS firmware (/usr/lib/firmware/qsee/) ships ONLY fpcber, gfber, cmnlib,
+  cmnlib64 — NO gatekeeper trustlet (and no keymaster image; keymaster64 is bootloader-resident app_id=1).
+  So Path A needs the Qualcomm "gatekeeper" TA extracted from the STOCK MIUI firmware (vendor/firmware or
+  /firmware/image on stock), added to /usr/lib/firmware/qsee/, then: load it -> RE its verify-password/enroll
+  -> HAT-mint API (like keymaster/fpcber) -> mint a HAT bound to a PIN -> feed to trusted ENROLL(1007) ->
+  continuous enroll -> template -> AUTHENTICATE(1010, no HAT) matches. Open risk: the gatekeeper<->gfber shared
+  HMAC key must be derivable on pmOS (same class of question as the keymaster fpcber-precondition; may just work).
+
+THREE-FRONTIER STATUS (end 2026-10-13):
+  1) enroll/auth unlock: BLOCKED on the gatekeeper TA (not on device; extract from stock MIUI). This is THE path.
+  2) libfprint/PAM: blocked behind (1); the libfprint MOC driver would load gatekeeper+mint HAT internally.
+  3) viewable image: INDEPENDENT of gatekeeper — capture works (op39 full frame/touch); needs a calibration
+     base (OPERATION_TEST_BIO_CALIBRATION / FINGER_BASE / HBD_CALIBRATION, grp3 arg# TBD) + op39-minus-base.
+     This is the one frontier pursuable now without the gatekeeper blob.
+Device left RAM-booted (qsee22, poco-usb); power-cycle -> installed r1, nothing flashed.
+
+### Finding AA — gatekeeper IS the keymaster TA (resident); HAT mintable on-device, NO blob needed (2026-10-13) **PATH A UNBLOCKED**
+The pmOS firmware has no gatekeeper trustlet, but gatekeeper does NOT need one: the vendor gatekeeper HAL
+(android.hardware.gatekeeper@1.0-impl-qti.so, pulled to scratchpad/gk/) implements enroll/verify by sending
+commands to the KEYMASTER TA via keymasterutils::KeymasterUtils::send_cmd (links libkeymasterdeviceutils.so).
+Keymaster is app_id=1, bootloader-resident (dedicated keymaster_a/b partitions) — the SAME TA we already call
+for the FP key (0x205). Disasm of GatekeeperHalDevice::verify @0x33b0 / ::enroll @0x3014 (objdump):
+  cmd id = csel on security_level (field [x21+0x10]): ==2 (StrongBox) -> 0x15xx else (TEE) -> 0x10xx.
+  **GK_ENROLL = 0x1001 (TEE) / 0x1501 (SB);  GK_VERIFY = 0x1002 (TEE) / 0x1502 (SB).** Our device = TEE.
+  verify request (80B buffer built via KeymasterBuffer::append_to_buf): [0x00]=cmd_id(0x1002), [0x04]=uid,
+  [0x08]=challenge(u64), then offset/length pairs at [0x10]+ for the appended {enrolled_password_handle,
+  provided_password}; data blob appended after the header (standard QTEE km serialization). verify output =
+  the 69B hw_auth_token (HAT), HMAC-signed, challenge-bound. enroll output = the password_handle.
+Signatures: GatekeeperHalDevice::enroll(uid, curHandle,len, curPw,len, desiredPw,len, ->outHandle,->len);
+  ::verify(uid, challenge, enrolledHandle,len, providedPw,len, ->outHAT,->len, ->reenroll).
+PATH A (now concrete, mostly NO-FINGER): keymaster(app1) cmd 0x1001 enroll(PIN) -> password_handle; then
+  cmd 0x1002 verify(uid, fp_challenge from gfber PRE_ENROLL(1006), handle, PIN) -> HAT; feed HAT into gfber
+  ENROLL(1007) -> should clear the challenge(1056)+HMAC(1057) checks -> trusted continuous enroll (TA holds
+  detect) -> template; AUTHENTICATE(1010, no HAT) matches. Only the enroll/auth frame-accumulation needs
+  touches; the HAT mint is no-finger.
+TODO to validate: (1) RE the exact append_to_buf wire format (offset/length pairs, blob order) for enroll +
+  verify; (2) build the two keymaster calls (extend the driver's keymaster path, or via the shim+python like
+  kmtest2.py); (3) mint a HAT (no finger) and feed gfber 1007 — if 1057 clears, Path A is proven; (4) then the
+  continuous enroll with touches. RISK: keymaster's gatekeeper HMAC key may need provisioning on pmOS (same
+  class as the fpcber precondition for 0x205) — unknown until tested. Vendor libs in scratchpad/gk/ (NOT repo).
+
+### Finding BB — HAT-mint harness built; keymaster dispatches gatekeeper cmds but returns -30 (2026-10-13)
+Built scratchpad/gkmint.py (over the /dev/qseecom shim): loads keymaster64 (app 1), sends GK_ENROLL(0x1001)
+then GK_VERIFY(0x1002) with the RE'd 32B-header request. Transport CONFIRMED correct: KeymasterUtils::send_cmd
+= plain QSEECom_send_cmd (disasm, 12B wrapper), and the shim SMC shows svc=0 cmd=1 status=0 result=0 (the TA
+RAN and returned) — so the keymaster TA genuinely dispatches the gatekeeper command. BUT it returns
+  resp[0] = 0xffffffe2 = -30 = KM_ERROR_VERIFICATION_FAILED   (for BOTH enroll and verify)
+on every variant tried (preconditions resident; null vs 0x20 current-pw offsets). For a first-time ENROLL
+there is nothing to verify, so -30 is NOT about the supplied password — it is the keymaster/gatekeeper
+INTERNAL key check failing. Prime hypothesis: the gatekeeper root/HMAC key is not provisioned on pmOS (the
+bootloader/keystore normally sets it at boot; same flavour as the keymaster-ROT story and the FP-key 0x205
+fpcber-precondition). Secondary: a still-wrong enroll serialization (the uid/field order — enroll writes
+[0]=cmd,[4]=w26,[8..]=3x{off,len}; w26 identity unconfirmed; uid may be a u64 SID).
+FORMAT CONFIRMED CORRECT (full enroll disasm trace, GatekeeperHalDevice::enroll @0x3014): for a first-time
+enroll (no current pw) the request is exactly [0x00]=cmd(0x1001), [0x04]=uid, [0x08..0x17]=0 (curHandle+curPw
+off/len all zero, via the 327c "stp xzr,xzr" path), [0x18]=desiredPw_off(=0x20 after the 32B header),
+[0x1c]=desiredPwLen, PIN at 0x20 — which is EXACTLY what gkmint.py sends. So -30 is NOT a format bug; it is a
+keymaster gatekeeper STATE/key issue. And -30 = KM_ERROR_VERIFICATION_FAILED is NOT the "not configured" code
+(that is -75), so keymaster configure (cmd 0x116, found in libqtikeymaster4.so KeymasterHalDevice::configure,
+sets os_version/patchlevel via a serialized key_param_set) is UNLIKELY to fix it.
+HONEST WALL: the keymaster gatekeeper refuses enroll with VERIFICATION_FAILED even with a correct request. On
+Qualcomm the gatekeeper handle is HMAC(password, salt, hw_derived_key) — the key is hardware-derived (not
+per-boot-provisioned), so a first enroll "should" just succeed; VERIFICATION_FAILED on enroll is anomalous.
+UID/PW SWEEP: uid {0,1,1000,10000,100000,0xdeadbeef} x pinlen {4,16} -> ALL -30 (input-independent => the
+gatekeeper path fails before reading params = a STATE/provisioning issue, not format).
+CONFIGURE LONG-SHOT TESTED + EXHAUSTED (gkconfig.py): keymaster configure = cmd 0x116, req [0]=0x116
+[4]=params_off(0xc) [8]=count, params = 12B each {tag(u32), value(u32), pad} (RE'd from params_serialize:
+append is always w2=0xc; type=(tag>>28)^8 indexes a jump table; UINT->u32). With the correct 12B/param format
+the length error cleared (-21 INVALID_INPUT_LENGTH -> -38), but configure returns -38 for EVERY os_version/
+patchlevel value (value-independent — likely already-configured / unsupported-via-this-path), and gatekeeper
+ENROLL stays -30 after every configure attempt. So configure is NOT the gate.
+FINAL (2026-10-13): the fingerprint UNLOCK is walled at the keymaster gatekeeper on pmOS. Both enroll routes
+dead: untrusted(1060) one-shot/no-accumulate (Finding Z); trusted(1007) needs a gatekeeper HAT that keymaster
+REFUSES to mint (-30, input-independent; correct request format confirmed by disasm; configure doesn't help).
+Transport + command IDs (GK_ENROLL 0x1001 / VERIFY 0x1002 / configure 0x116) + request formats all RE'd and the
+TA dispatches — the TA itself refuses. A REAL unlock needs a bootloader/keystore-level fix to the keymaster
+gatekeeper state (beyond Linux userspace). WHAT WORKS: the reader is fully alive to frame CAPTURE (power/clk/
+reset, keymaster FP key via fpcber, gfber init, firmware version, op39 frame on touch). Tools gkmint/gksweep/
+gkconfig.py + vendor libs in scratchpad/gk/. Device left RAM-booted (shim loaded, goodix_fp unloaded);
+power-cycle -> installed r1.
+
 NEXT (needs Yaron+device, when back): run step4 no-touch probe — does TEST enroll/auth gate before touch?
   does grp1/1007 with a zeroed HAT return INVALID_HAT (=> gatekeeper needed) or dispatch? Then step5/6
   touch enroll+auth and read the trace to pin the enroll-remaining / match-fid offsets. THEN decide:
