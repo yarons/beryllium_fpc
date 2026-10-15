@@ -124,6 +124,84 @@ Halium or a replicated command sequence), not a bootloader change. If the ROT is
 locked, it is lk2nd. **Resolving Open #1 (param format → a working `generate_key`) and Open #2 (ROT
 state) decides which.**
 
+## 2026-10-15 session 2 — exact ABI recovered; Open #1 & #2 resolved; the wall re-characterized
+
+**Big update: the earlier "wrong param format" / "ROT maybe unset" branches are now closed by
+reverse-engineering the vendor HAL (`libqtikeymaster4.so` / the keymaster3 HAL) and by on-device
+probing. The wall is not format, not transport, and not the bootloader ROT.** All results below are
+reproducible from this repo's shim; scripts: `gkgen5.py`, `gkcfg.py`, `gkdisc.py`, `gksweep2.py`,
+`gkhmac2.py`, `gkver.py` (project scratchpad).
+
+### Open #1 — RESOLVED: exact keymaster `generate_key` / `configure` wire format
+RE'd from `KeymasterHalDevice::generate_key_common`, `configure`, and `params_serialize` (disasm):
+
+```
+request:  [u32 cmd][u32 params_offset = 0x0c][u32 param_COUNT]  then COUNT x 12-byte records
+record (12B): [u32 tag][value]   value width by tag type nibble (tag>>28):
+  1/2/3/4 ENUM,ENUM_REP,UINT,UINT_REP -> u32 (+pad to 12)
+  5/6/0xA ULONG,DATE,ULONG_REP         -> u64
+  7       BOOL                          -> 1 byte
+  8/9     BIGNUM,BYTES                  -> [u32 offset_from_buf_start][u32 len]; data in a
+                                           separate indirect region after the records
+response: [i32 status][...][u32 key_blob_offset @0x08][u32 key_blob_len @0x0c]
+```
+This is **not** the AOSP `AuthorizationSet::Serialize` framing (no `indirect_size/count/elems_bytes`
+prefix) — QTI uses a bare 12-byte-record array with the count in the header. Our original guess was
+structurally correct; `generate_key` reaches **semantic** validation, so the format is **not** the
+blocker.
+
+- **`generate_key (new) = 0x508` is the StrongBox/SPU command** (selected only when the HAL's
+  `security_level == 2`). SDM845 beryllium has no SPU, so `0x508` → `-40` is meaningless noise. The
+  real generate on this TA is **`0x108`** (confirmed identical selection logic in the KM3 and KM4 HALs).
+
+### Open #2 — RESOLVED: the Root of Trust *is* set by the bootloader
+Probing the ROT-set command range: `0x20c` / `0x20d` → **`-1 ROOT_OF_TRUST_ALREADY_SET`**. So ABL/XBL
+provisions the ROT before Linux; lk2nd-beryllium does not need to (and `SET_ROT 0x201` → `-15` is just
+the TA refusing a second/foreign set). **The ROT is not the gap.**
+
+### The wall, re-characterized: every privileged keymaster op is refused by a canned, input-independent error — in-TZ
+With the exact format, and varying every input, the response-buffer placement (far vs contiguous) and
+the transport (plain `SEND_CMD` vs `SEND_MODFD_CMD`):
+
+| Command | ID | Result | Moves with input? |
+|---|---|---|---|
+| get_version | `0x200` | **0** (reports keymaster **message v3**) | n/a (works) |
+| read_device_state | `0x202/0x203` | **0** | n/a (works) |
+| ROT query | `0x20c/0x20d` | **-1 ROT_ALREADY_SET** | n/a |
+| generate_key | `0x108` | **-8**, frozen (even **empty** params; AES/RSA/EC/HMAC all identical) | **no** |
+| configure | `0x116` | **-38**, frozen (every os_version/patchlevel tried) | **no** |
+| get_hmac_sharing_params | `0x706` | **-40**, frozen (no-arg command) | **no** |
+| compute_shared_hmac | `0x707` | **-40**, frozen | **no** |
+| gatekeeper enroll | `0x1001` | **-30**, frozen | **no** |
+
+Crucial: these commands **complete inside the TA** — the shim's `qs_send` returns `0` (SMC
+`r.result == 0`) and the keymaster error is delivered *in-band* in the response buffer. No QSEE
+**listener** callback is triggered (a pending listener would surface as `r.result != 0` → `-EIO`,
+which never happens). So the shim's missing listener services are **not** the cause for these
+failures, and **transport/format/placement are all ruled out.** The refusal is a pure **internal TA
+precondition/state check**.
+
+### What this means
+The TA answers read/utility commands but refuses *every* key-creating / config / HMAC-sharing /
+gatekeeper-enroll command with a fixed, input-independent error, entirely in secure world. That is the
+signature of a **secure-world bring-up step that Android's `keystore2` / `gatekeeperd` / early-boot
+stack performs once per boot and that pmOS never does** — and the natural entry point to reproduce it
+(`get_hmac_sharing_parameters 0x706`) is itself refused from the plain userspace path. Whether that
+bring-up is reachable from a privileged Linux context or only from the bootloader/TZ is **the**
+remaining question; the evidence (even the no-arg `0x706` is refused; nothing input-dependent ever
+parses) leans toward a boot-context/privilege gate rather than a single sendable command.
+
+### Sharpest next experiments (for extra eyes)
+1. **Instrument the shim** (`qs_send`): log `r.result` and detect `QSEOS_RESULT_INCOMPLETE /
+   BLOCKED_ON_LISTENER` on `0x108/0x116/0x706/0x1001`, to *prove* (not infer) no listener is wanted.
+2. **Capture a stock-boot keymaster trace** (what `keystore2`/`gatekeeperd` send at boot on stock
+   MIUI/LOS) and replay it verbatim — especially whatever precedes the first `generate_key`.
+3. **`configure 0x116` with the full boot-param tag set** (VERIFIED_BOOT_STATE, BOOT_PATCHLEVEL,
+   VBMETA_DIGEST), not just os_version/patchlevel — `-38` may mean "missing required boot params".
+4. If 1–3 show the gate needs TZ/boot context → it is an **lk2nd / early-init** step after all.
+5. Pragmatic alternative for a *working* (if not PIN-bound) unlock: the **libfprint image path**
+   (software match on `op39` frames) — independent of this entire keymaster wall.
+
 ## The route — investigation order (if it is the bootloader after all)
 
 1. **Is the Root of Trust actually set on this boot?** Query keymaster for something ROT-dependent
