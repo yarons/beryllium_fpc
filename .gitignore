@@ -1,0 +1,23 @@
+# third-party / proprietary: NEVER publish
+# Qualcomm/Goodix signed TA blobs (gfber/fpcber/cmnlib .mdt/.b0*)
+ta/
+# vendor HIDL service binaries
+vendor/
+# Qualcomm/Sony reference source (copyrighted)
+ref/
+# MiCode/Xiaomi downstream kernel source
+downstream/
+# kernel patches: triage before publishing
+*.patch
+# build/binary artifacts
+*.ko
+*.so
+*.raw
+*.img
+*.dtb
+
+# stale planning script that insmods spi-geni (SoC-hang dead end) — not for publish
+TOMORROW-PLAN.sh
+
+# local draft, post externally — not repo content
+FORUM-POST.md

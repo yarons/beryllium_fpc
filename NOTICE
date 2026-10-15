@@ -1,0 +1,41 @@
+NOTICE
+======
+
+Authorship and AI assistance
+----------------------------
+This is personal reverse-engineering of the author's own Pocophone F1, done for
+interoperability (getting the fingerprint sensor working under mainline Linux /
+postmarketOS).
+
+A large part of the work in this repository — the reverse-engineering analysis,
+the kernel driver, the probe scripts, and the notes — was produced with the help
+of an AI coding assistant (Anthropic Claude). It has been reviewed by the author,
+but readers and downstream projects should be aware of it. Some upstream projects
+forbid or restrict AI-assisted contributions; check the target project's
+AI-contribution policy before submitting any of this material to it. (For example,
+postmarketOS does not accept AI-generated contributions.)
+
+Excluded proprietary material
+-----------------------------
+This repository deliberately does NOT contain, and must not be used to redistribute:
+
+  * The signed Qualcomm/Goodix TrustZone applications and libraries
+    (gfber, fpcber, cmnlib / cmnlib64 — the .mdt and .b0* segment files).
+  * The vendor Android HIDL fingerprint service binary.
+  * Qualcomm, Sony, or Xiaomi/MiCode reference source used during analysis.
+
+Those are the property of their respective owners. Extract the TrustZone blobs
+your build needs from your own device's firmware. The .gitignore in this repo is
+configured to keep them out of version control.
+
+Redacted material
+-----------------
+Device-specific key material and tokens captured during analysis (e.g. the raw
+keymaster fingerprint key bytes and sensor device tokens) have been redacted from
+the notes. Only the protocol structure — field offsets, lengths, status codes — is
+documented.
+
+Warranty
+--------
+Provided as-is, with no warranty. Probing TrustZone and the serial engine on this
+SoC can hang the device; see the safety section of the README.
