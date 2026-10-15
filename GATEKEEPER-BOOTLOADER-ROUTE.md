@@ -263,6 +263,46 @@ polls that property before it will use keymaster. On pmOS none of that exists:
 - This is sizeable (kernel + daemon + UFS-RPMB), but it is ordinary Linux driver/daemon work — the
   reverse-engineering uncertainty is now gone.
 
+## 2026-10-15 session 5 — listener framework BUILT + BOOTED; but keymaster makes NO listener call from Linux (corrects session 3)
+
+Built the qcom_scm QSEE listener framework ([`kernel-patches/`](kernel-patches/)), compiled it in-tree
+against the fork, RAM-booted it on-device. Then tested against a **pristine TZ** (full power cycle;
+keymaster verified untouched — no shim, no `/dev/qseecom`, before driving it):
+
+- `add_rng_entropy(0x107)`, `configure(0x116)`, `generate_key(0x108)`, `gatekeeper enroll(0x1001)` —
+  **every one still refuses** (`-8`/`-38`/`-30`) and **every SCM response is `resp_type = APP_ID
+  (0xee01)`**. Across the whole sequence there are **zero** `QSEOS_LISTENER_ID (0xee02)` returns and
+  **zero** `INCOMPLETE` results. (The kernel's `qseecom raw:` log shows every SMC; none is a listener
+  request.)
+
+**So the keymaster TA does not call back to a normal-world listener for these operations, even on a
+fresh boot.** The listener framework is correct (it compiles, boots, and does not break qseecom), but
+it is **not** the lever that unblocks keymaster from Linux. This **corrects session 3's conclusion**
+that "the fix is the QSEE secure-storage/RPMB listener": that is necessary infrastructure on Android,
+but on this device the TA refuses *before* it ever reaches the storage/listener code path.
+
+### Revised reading
+The refusal is an **upstream boot-state/provisioning gate**, settled before Linux can influence it:
+- ROT **is** set (`0x20c → ALREADY_SET`), but `SET_BOOT_STATE(0x208)` from userspace → `-15
+  INVALID_USER_ID` (bootloader-only). The TA most likely wants its **verified-boot state / boot
+  patchlevel** set by the bootloader, which pmOS/lk2nd never sends — so the TA sits in an
+  unprovisioned-boot state and refuses key ops *before* any storage access. That points back at
+  **bootloader (lk2nd) work** — issuing the keymaster boot-state SMC — not a Linux listener.
+- The TA appears to settle this at XBL/bootloader load time and cache it; a kernel RAM-boot does not
+  reset it (TZ persists across warm reboots), and a cold boot re-runs XBL which reaches the same state.
+
+### Status of the listener work
+Kept as correct infrastructure — it will still be needed once the TA gets *past* the boot-state gate
+and actually reaches RPMB/SFS (as it does on Android). But it is not sufficient on its own.
+
+### Decisive next test (not yet run — higher risk)
+Force the keymaster TA to **re-run its init in Linux**: shut it down (shim `UNLOAD`/app_shutdown) and
+reload `app_id 1` from the `keymaster_a` image, so its `rpmb_init`/`qsee_stor_device_init` runs with the
+Linux listener available. If a listener request (`0xee02`) then appears, the storage path *is* reachable
+from Linux and the listener is the lever after all; if it still refuses with no listener call, the
+boot-state gate is confirmed and the work moves to lk2nd. Risk: reloading a resident TA can wedge
+keymaster until a cold boot.
+
 ## The route — investigation order (if it is the bootloader after all)
 
 1. **Is the Root of Trust actually set on this boot?** Query keymaster for something ROT-dependent
