@@ -44,15 +44,29 @@ git apply --3way ../fingerprint/kernel-patches/0001-qcom_scm-qseecom-listener.pa
 # and delete the two WARN_ON(res->result == QSEECOM_RESULT_{INCOMPLETE,BLOCKED_ON_LISTENER}) lines.
 ```
 
-`qcom_scm` is built into the image (not a module), so this needs a kernel rebuild (`build-env/build.sh`)
-and a RAM-boot to test (`fastboot boot` the test image — do **not** flash first). Risk: a RAM-boot can
-drop the device off USB and need a manual power-cycle; never do it unattended.
+`qcom_scm` is built into the image (not a module), so this needs a kernel rebuild and a RAM-boot to
+test. **Built + verified 2026-10-15** on the `qseecom/7.2.9-listener` fork branch: `qcom_scm.o` compiles,
+the full kernel builds, and a ready image is packaged. Artifacts (local, not committed — `*.img`/`*.ko`
+are gitignored):
+- `dist/boot-listener.img` — RAM-bootable listener kernel.
+- `dist/qseecom_shim-listener.ko` — shim rebuilt to the matching vermagic (`7.2.9-sdm845`).
 
-Smoke test (no fingerprint needed): from a kernel module (or extend `qseecom_shim`) register a dummy
-listener with a tzmem `sb` and a `service` that returns `QSEECOM_LISTENER_SUCCESS`, then re-run the
-keymaster init path. Success signal: the keymaster TA's init stops bailing — `generate_key(0x108)` moves
-off its frozen `-8`, and the kernel log shows sends returning `resp_type = QSEOS_LISTENER_ID (0xee02)`
-being serviced instead of the TA refusing early.
+### Discovery test — reveals the listener IDs the keymaster TA wants (no backend needed)
+With the framework in but **no** listener registered, a TA listener request is answered with a graceful
+failure and logged as `qseecom: no listener <ID> registered` — which *names the ID*. That is how we learn
+the SFS/RPMB listener IDs for the backends.
+
+1. RAM-boot (do **not** flash; a RAM-boot can drop USB and need a manual power-cycle — never unattended):
+   `fastboot boot dist/boot-listener.img`
+2. Push + load the matching shim: `scp dist/qseecom_shim-listener.ko poco:/tmp && ssh poco sudo insmod /tmp/qseecom_shim-listener.ko`
+3. `ssh poco sudo dmesg -C`, then run a keymaster probe that drives init (e.g. `tools/keymaster-gatekeeper/gkver.py` — load keymaster64 + a send), then `ssh poco sudo dmesg`.
+4. Read the log:
+   - `qseecom: no listener <ID> registered` → **record `<ID>`** (this is the RPMB or SFS service). Repeat per distinct ID.
+   - sends now reaching the loop show `resp_type = QSEOS_LISTENER_ID (0xee02)` being serviced, instead of the TA refusing early with `resp_type = APP_ID (0xee01)`.
+   - keymaster still bails (we failed its request), but now we know *which* listeners to implement.
+
+Full smoke test (after backends exist): register the real SFS/RPMB listeners, re-run keymaster init;
+success = `generate_key(0x108)` moves off its frozen `-8`.
 
 ## Next component (not here yet): the storage listener services
 The keymaster TA needs two real listeners at init (`rpmb_init`, `qsee_stor_device_init`):
