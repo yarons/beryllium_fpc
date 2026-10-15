@@ -295,13 +295,28 @@ The refusal is an **upstream boot-state/provisioning gate**, settled before Linu
 Kept as correct infrastructure — it will still be needed once the TA gets *past* the boot-state gate
 and actually reaches RPMB/SFS (as it does on Android). But it is not sufficient on its own.
 
-### Decisive next test (not yet run — higher risk)
-Force the keymaster TA to **re-run its init in Linux**: shut it down (shim `UNLOAD`/app_shutdown) and
-reload `app_id 1` from the `keymaster_a` image, so its `rpmb_init`/`qsee_stor_device_init` runs with the
-Linux listener available. If a listener request (`0xee02`) then appears, the storage path *is* reachable
-from Linux and the listener is the lever after all; if it still refuses with no listener call, the
-boot-state gate is confirmed and the work moves to lk2nd. Risk: reloading a resident TA can wedge
-keymaster until a cold boot.
+### Force-reinit test — RUN (2026-10-15): keymaster is bootloader-managed, not Linux-reloadable
+Forced the keymaster TA to try re-running its init in Linux: shut it down (shim `UNLOAD`/app_shutdown)
+and reload `app_id 1` from the dumped `keymaster_a` image (split into `qsee/keymaster64.mdt` + `.b00..b07`
+in the shim's firmware format).
+- **Shutdown succeeded** (`qseecom: shutdown app_id=1 -> ret=0 result=0`) — keymaster is *not* a locked
+  resident app; TZ let it be unloaded. `app_get_id("keymaster64")` afterwards → not found (it is gone).
+- **Reload failed** — `LOAD → -EINVAL`. TZ refuses to app-load `keymaster64` via the normal
+  `QSEOS_APP_START` path. keymaster is `app_id 1`, a **reserved, bootloader-PIL-loaded TA**, not one the
+  runtime app loader will (re)start.
+- Therefore its init/provisioning **cannot be re-run from Linux at all**, and no listener request ever
+  appears. This **confirms the boot-state gate**: keymaster's secure-boot/provisioning state is
+  established by the bootloader (XBL/ABL) and is not reachable or resettable from the kernel.
+
+keymaster stays down until a **cold boot** (power cycle), which re-runs XBL and reloads it. (Normal pmOS
+use is unaffected — nothing on pmOS uses keymaster.)
+
+**Verdict:** the lever for Path A is **lk2nd / the bootloader**, not a Linux listener or userspace. The
+listener framework is kept as correct, necessary infrastructure (it will still be needed once the TA is
+provisioned at boot and reaches RPMB), but it is not where the fix is. Next concrete lead: have lk2nd
+send the keymaster **boot-state SMC** (`SET_BOOT_STATE 0x208`, the step pmOS/lk2nd currently skips;
+`-15 INVALID_USER_ID` from userspace confirms it is bootloader-only) so the TA leaves its
+unprovisioned-boot state and stops refusing key ops before storage.
 
 ## The route — investigation order (if it is the bootloader after all)
 
