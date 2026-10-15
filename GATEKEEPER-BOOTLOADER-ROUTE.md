@@ -68,11 +68,21 @@ being derived/provisioned** because that boot-time setup is absent.
    (an attestation / `GET_HW_INFO` / a key-gen that binds ROT) and compare pmOS vs a stock-boot
    capture. If the ROT is missing, that is the gap.
 2. **Can the missing step be done from Linux userspace?** This is the best case — no bootloader
-   change. Candidates: a keymaster provisioning command (see `libkeymasterprovision.so`,
-   `ProvisionDeviceId` / attestation-key provisioning), the ROT-set SMC if it is not yet locked, or
-   the `keystored`/`gatekeeperd` init sequence replayed over the `/dev/qseecom` shim. **RE
-   `libkeymasterprovision.so` + `libqtikeymaster4.so` to extract that exact sequence** (we RE'd the
-   gatekeeper commands this way; the provisioning commands are in the same libs).
+   change. We RE'd the provisioning commands and **tried the most promising ones over the shim; none
+   open the gatekeeper:**
+   - keymaster `configure(0x116)` (os-version/patchlevel) → `-38`, does not change the enroll.
+   - **`KM_GET_HMAC_SHARING_PARAMETERS (0x706)` + `KM_COMPUTE_SHARED_HMAC (0x707)`** — the
+     ISharedSecret protocol that establishes the gatekeeper/keymaster shared HMAC key — → **`0x706`
+     returns `-40`**. The resident `keymaster64` TA does **not** implement shared-HMAC (consistent
+     with a keymaster **3.0** TA; ISharedSecret is a 4.0 concept, even though a `libqtikeymaster4.so`
+     ships on the device). So the KM4 shared-secret route does not apply to this TA.
+   Remaining userspace candidates (unexplored): a KM3-era auth-token-key / gatekeeper-key init
+   (check `android.hardware.keymaster@3.0-impl-qti.so` + `libkeymasterdeviceutils.so` for a
+   `get_auth_token_key`-style command), or `libkeymasterprovision.so`'s `KeyMasterProvisionInit` /
+   `ProvisionDeviceId` / keybox-install path (device-ID/attestation provisioning — may or may not
+   touch the gatekeeper key). The resident TA dispatches these commands but rejects them
+   (`enroll -30`, `configure -38`, `shared-hmac -40`), which points to **state the Android
+   keystore/gatekeeperd/bootloader stack sets up at boot** rather than a single sendable command.
 3. **If it must happen in the bootloader**, add it to **lk2nd**: send the keymaster ROT / run the
    provisioning SMC before handing off to Linux. ROT-set is typically a one-shot locked after first
    call, so if XBL already locked it with a different value, this may be impossible without changing
