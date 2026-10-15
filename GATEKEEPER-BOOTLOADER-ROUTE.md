@@ -202,6 +202,66 @@ parses) leans toward a boot-context/privilege gate rather than a single sendable
 5. Pragmatic alternative for a *working* (if not PIN-bound) unlock: the **libfprint image path**
    (software match on `op39` frames) — independent of this entire keymaster wall.
 
+## 2026-10-15 session 3 — ROOT CAUSE PROVEN: the missing QSEE secure-storage / RPMB listener
+
+**The gate is no longer a hypothesis.** Dumped the keymaster TA from the `keymaster_a` partition (authorized
+RE of an owned device; the TA binary is **not** redistributed) and disassembled it (capstone). The wall is
+the **absent QSEE secure-storage/RPMB listener service**, and it is a **Linux-side** problem — *not* the
+bootloader. This supersedes the "boot-context/lk2nd, mechanism unknown" framing above and the
+bootloader-centric "## The route" section below.
+
+### The TA bails during init when secure storage is unavailable
+Keymaster TA init path (reconstructed from disasm + its own diagnostic strings):
+`KEYMASTER Init → is_secure_boot_enabled → rpmb_init → qsee_stor_device_init`.
+- `rpmb_init` failure → **KM_ERROR_KEYMASTER_NOT_CONFIGURED (-64)**.
+- on a secure-boot device, `qsee_stor_device_init` failure → logs *"secboot device && rpmb error, BAILING
+  OUT"*, returns **-10001**, and sets a global keymaster-failed flag.
+beryllium's TZ secure-boot fuse is blown independently of the bootloader unlock → it **is** a secboot
+device → when storage is unavailable the TA bails at init and marks keymaster not-ready.
+
+### Every refused command is storage-backed; every working command is not
+- **Work** (no secure storage): `GET_VERSION 0x200`, device-state `0x202`, ROT-query `0x20c`
+  (ALREADY_SET), OEM Goodix FP-key `0x205`.
+- **Refused** (need secure storage / RPMB): `generate 0x108 (-8)`, `configure 0x116 (-38)`,
+  shared-hmac `0x706/0x707 (-40)`, **gatekeeper enroll `0x1001 (-30)`**.
+Gatekeeper enroll is RPMB-backed *directly*: its handler calls `gk_get_rpmb_data` / `ThrottleRequest` /
+RPMB reboot-detection (the TA's own strings) — without RPMB it fails, hence the input-independent `-30`.
+Because the TA already bailed at init, these refuse **without even attempting a listener callback** — the
+kernel log shows every send returning `resp_type = QSEOS_APP_ID (0xee01)`, never `QSEOS_LISTENER_ID
+(0xee02)`.
+
+### Why pmOS can't satisfy it (and Android does)
+Android's **qseecomd** registers the QSEE listener services (an **RPMB** relay and a **Secure File System**
+service) and then sets `vendor.sys.listeners.registered=true`. The vendor HAL's `gk_initialize` literally
+polls that property before it will use keymaster. On pmOS none of that exists:
+- the fork's `qcom_scm` exports only `qcom_scm_qseecom_app_{get_id,send,send_phys,load_image,shutdown,
+  region_notify}` (the set needed for `uefisecapp`) — **no listener-callback framework** (no
+  register-listener, no `QSEOS_RESULT_INCOMPLETE`/`QSEOS_LISTENER_ID` continuation loop). The
+  `/dev/qseecom` shim stubs `RECEIVE_REQ`/`SEND_RESP_REQ` accordingly.
+- no userspace listener daemon.
+
+### The fix (entirely Linux-side; ROT already set, no lk2nd change)
+1. **Kernel** — add QSEE listener support to `qcom_scm`: the register-listener call and the
+   incomplete-command continuation loop (when the TA returns `QSEOS_LISTENER_ID`, hand the request to
+   userspace and resume after the response). Wire it through the shim's existing
+   `RECEIVE_REQ`/`SEND_RESP_REQ` ioctls.
+2. **Userspace** — a small qseecomd-equivalent implementing the two services the TA needs at init:
+   - **Secure File System (SFS)** — back it with the `storsec_a`/`storsec_b` partitions (present on this
+     device: `sde10`/`sde11`).
+   - **RPMB relay** — relay the TA's RPMB frames to the UFS RPMB well-known LUN. **Prerequisite:** this is
+     a **UFS** device (no eMMC `/dev/*rpmb`); the UFS RPMB LUN is **not currently exposed** to Linux, so a
+     UFS-RPMB chardev / scsi-generic path must be enabled first. The listener is only a frame **relay** —
+     the RPMB authentication key lives inside the TA (factory-provisioned), so the daemon needs no secret.
+3. Then keymaster init succeeds → `generate`/`configure`/`GK_ENROLL(0x1001)` work → mint a HAT →
+   trusted `gfber ENROLL(1007)` → `AUTHENTICATE(1010)` → libfprint/fprintd/pam_fprintd → Phosh.
+
+### Open specifics for implementers
+- Exact QSEE **listener service IDs** for SFS and RPMB on this TZ build (recoverable from qseecomd, or by
+  logging the shim's first `RECEIVE_REQ` once callback support exists).
+- UFS RPMB LUN exposure on mainline sdm845.
+- This is sizeable (kernel + daemon + UFS-RPMB), but it is ordinary Linux driver/daemon work — the
+  reverse-engineering uncertainty is now gone.
+
 ## The route — investigation order (if it is the bootloader after all)
 
 1. **Is the Root of Trust actually set on this boot?** Query keymaster for something ROT-dependent
