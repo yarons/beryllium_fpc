@@ -884,6 +884,28 @@ reset, keymaster FP key via fpcber, gfber init, firmware version, op39 frame on 
 gkconfig.py + vendor libs in scratchpad/gk/. Device left RAM-booted (shim loaded, goodix_fp unloaded);
 power-cycle -> installed r1.
 
+### Finding CC — Path B (software image matching) tested: real baseline helps but op39 isn't clean, and the TA won't hand back a preprocessed image (2026-10-15)
+BASELINE SUBTRACTION (the piece we never had — a real finger-OFF frame, captured via direct `capture`
+pull, 3 averaged): finger op39 frame minus averaged baseline, per slot, W=108. s2 best (finger_sd 391,
+base_sd 130, diff_sd 261). This EXPOSED real finger signal that the old flat-constant baseline hid: the
+radial power now has a broad RIDGE-BAND plateau at k7-11 (10-15px period) and the ridge-freq energy is
+spread across MANY orientations (0/30/60/135/165 deg), consistent with curved ridge flow — NOT the old
+monotonic decay. BUT the rendered image is still dominated by horizontal ROW-READOUT structure; after
+row+col FPN removal there is structure + a central contact region but no clean, traceable ridge flow.
+=> op39 raw frames carry the finger but are not clean enough for reliable NBIS software matching as-is.
+PREPROCESSED FRAME LEVER = DEAD: armed UNTRUSTED_ENROLL(1060), touch -> op34 acquire (irq_type=0x2), but
+the gf_img buffer is EMPTY (nz=0, no high-variance region anywhere). So the TA processes enroll/auth frames
+INTERNALLY and does not write a preprocessed image back to our buffer — only op39 (raw TEST_REAL_TIME_DATA)
+gives a readable frame. So we cannot get the TA's clean "Preprocess_v" image out.
+HONEST STATUS (both unlock paths): A) gatekeeper HAT — walled (keymaster refuses enroll, -30 input-indep;
+bootloader/keystore-level fix needed). B) software image matching — MARGINAL: only the raw op39 frame is
+available, it has real finger signal after a proper baseline subtraction but is dominated by sensor row
+readout; the TA's clean preprocessed image is not exposed. A reliable daily-driver unlock is NOT reachable
+with current access. Possible (low-confidence, more work): multi-frame op39 averaging + a real calibration/
+base command (OPERATION_TEST_BIO_CALIBRATION, grp3 arg still TBD) + a tuned minutiae pipeline; uncertain it
+reaches match-grade. What WORKS remains: reader fully alive to raw frame capture. Frames saved scratchpad/
+{finger,nbase1-3,op34}.raw; analysis imgsub.py.
+
 NEXT (needs Yaron+device, when back): run step4 no-touch probe — does TEST enroll/auth gate before touch?
   does grp1/1007 with a zeroed HAT return INVALID_HAT (=> gatekeeper needed) or dispatch? Then step5/6
   touch enroll+auth and read the trace to pin the enroll-remaining / match-fid offsets. THEN decide:

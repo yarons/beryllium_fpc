@@ -1,0 +1,94 @@
+# The bootloader route to a working fingerprint unlock (Path A)
+
+> For anyone (pmOS / lk2nd / sdm845 folks) who wants to take the Pocophone F1 Goodix
+> fingerprint from "reader works, no unlock" to a real unlock. Context: [`UNLOCK.md`](UNLOCK.md),
+> deep log in [`re/notes/protocol.md`](re/notes/protocol.md). AI-assisted; see [`NOTICE`](NOTICE).
+
+## The problem, precisely
+
+The reader works end-to-end **up to frame capture** (keymaster FP key, `gfber` init, firmware
+version, a real `op39` frame on touch). What is blocked is **enroll** — and therefore any match:
+
+- The Goodix TA (`gfber`) `ENROLL` (grp1/1007) requires a **gatekeeper HAT** (hardware auth token)
+  and genuinely verifies its HMAC (confirmed: fixing the challenge moves the error `1056`→`1057`,
+  the HMAC check).
+- The untrusted enroll (grp3/1060) is one-shot and cannot accumulate a template.
+- Software image matching is **not viable** either: the raw `op39` frames can't discriminate
+  fingers (tested — same-finger pairs score no higher than different-finger pairs), and the TA
+  keeps its preprocessed image internal.
+
+So a working unlock needs a **real gatekeeper HAT**, and the gatekeeper **refuses to produce one**.
+
+## What we reverse-engineered about the gatekeeper
+
+On Qualcomm there is **no separate gatekeeper trustlet** — gatekeeper is implemented **inside the
+keymaster TA** (resident, `app_id = 1`). The vendor HAL
+`android.hardware.gatekeeper@1.0-impl-qti.so` sends commands to keymaster via
+`keymasterutils::KeymasterUtils::send_cmd` (a plain `QSEECom_send_cmd`). The commands:
+
+| Command | ID (TEE / StrongBox) | Request shape |
+|---|---|---|
+| `GK_ENROLL` | `0x1001` / `0x1501` | `[0]=cmd [4]=uid [8..]=3×{off,len}` for {curHandle, curPw, desiredPw} |
+| `GK_VERIFY` | `0x1002` / `0x1502` | `[0]=cmd [4]=uid [8]=challenge(u64) [10..]=2×{off,len}` for {handle, pw} |
+| keymaster `configure` | `0x116` | `[0]=cmd [4]=params_off [8]=count` + params, each 12B `{tag,u32,pad}` |
+
+The keymaster TA **dispatches** these (the SMC succeeds, the TA runs) but **`GK_ENROLL` returns
+`-30` = `KM_ERROR_VERIFICATION_FAILED`** — **identical across every uid and password**, i.e. it
+fails *before* reading the request. A first-time enroll has nothing to verify, so this is the
+keymaster/gatekeeper **internal key/state check failing**, not a bad request.
+
+### Ruled out (so you don't repeat it)
+
+- **Request format** — confirmed correct by disassembling `GatekeeperHalDevice::enroll/verify`.
+- **uid / password** — swept uid `{0,1,1000,10000,100000,0xdeadbeef}` × pw-len `{4,16}`; all `-30`.
+- **keymaster `configure(0x116)`** — serialization RE'd and sent (params `KM_TAG_OS_VERSION`
+  `0x300002C1`, `KM_TAG_OS_PATCHLEVEL` `0x300002C2`); it returns `-38` for any value and does **not**
+  change the enroll `-30`.
+
+Note keymaster is **not** dead in general: the Goodix FP-key op (`0x205`) works once the FPC TA
+`fpcber` is resident. So this is **gatekeeper-specific**: the gatekeeper key path is uninitialized.
+
+## The hypothesis: missing boot-time provisioning
+
+On Android the boot chain initializes keymaster/gatekeeper; on postmarketOS it does not:
+
+1. **XBL/ABL** set the keymaster **Root of Trust** (verified-boot key hash + lock state) via a
+   one-shot SMC early in boot. (On the Poco F1, Qualcomm's XBL/ABL still run before lk2nd, so the
+   ROT *may* already be set — worth verifying, not assuming.)
+2. **keystored** calls keymaster `configure(os_version, patchlevel)` and `addRngEntropy` at boot.
+3. **gatekeeperd / vold** drive gatekeeper for lockscreen auth.
+
+On pmOS, lk2nd chainloads Linux and none of the keystore/vold/gatekeeperd initialization happens.
+The input-independent `VERIFICATION_FAILED` is consistent with the **gatekeeper HMAC key never
+being derived/provisioned** because that boot-time setup is absent.
+
+## The route — investigation order
+
+1. **Is the Root of Trust actually set on this boot?** Query keymaster for something ROT-dependent
+   (an attestation / `GET_HW_INFO` / a key-gen that binds ROT) and compare pmOS vs a stock-boot
+   capture. If the ROT is missing, that is the gap.
+2. **Can the missing step be done from Linux userspace?** This is the best case — no bootloader
+   change. Candidates: a keymaster provisioning command (see `libkeymasterprovision.so`,
+   `ProvisionDeviceId` / attestation-key provisioning), the ROT-set SMC if it is not yet locked, or
+   the `keystored`/`gatekeeperd` init sequence replayed over the `/dev/qseecom` shim. **RE
+   `libkeymasterprovision.so` + `libqtikeymaster4.so` to extract that exact sequence** (we RE'd the
+   gatekeeper commands this way; the provisioning commands are in the same libs).
+3. **If it must happen in the bootloader**, add it to **lk2nd**: send the keymaster ROT / run the
+   provisioning SMC before handing off to Linux. ROT-set is typically a one-shot locked after first
+   call, so if XBL already locked it with a different value, this may be impossible without changing
+   the earlier chain — establish that first.
+4. **Then** mint the HAT: `GK_ENROLL(0x1001)` with a PIN → handle, `GK_VERIFY(0x1002)` with the
+   `gfber` pre-enroll challenge → HAT, feed to `gfber` `ENROLL(1007)` → continuous enroll →
+   `AUTHENTICATE(1010)` → libfprint/fprintd/pam_fprintd → Phosh. **No Phosh changes needed.**
+
+## Pointers
+
+- Vendor libs that hold the provisioning/keymaster logic (extract from your own device; **not**
+  redistributed here): `libqtikeymaster4.so`, `libkeymasterprovision.so`,
+  `libkeymasterdeviceutils.so`, `android.hardware.gatekeeper@1.0-impl-qti.so`.
+- lk2nd (the pmOS bootloader for sdm845) is where a boot-time SMC would go.
+- The `/dev/qseecom` shim + driver in this repo let you talk to keymaster (`app_id 1`) and `gfber`
+  from Linux to prototype any userspace provisioning before touching the bootloader.
+
+If you crack step 1/2, the rest is already mapped here. The most valuable next result is simply
+**knowing whether the ROT/provisioning gap can be closed from userspace or only from lk2nd.**

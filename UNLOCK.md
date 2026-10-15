@@ -58,6 +58,7 @@ from Linux userspace.
 ## Two realistic paths forward
 
 **A. Provision the gatekeeper at the bootloader level (lk2nd / pmOS).**
+(Full investigation plan: [`GATEKEEPER-BOOTLOADER-ROUTE.md`](GATEKEEPER-BOOTLOADER-ROUTE.md).)
 Make lk2nd (or an early pmOS boot step) perform the keymaster/gatekeeper initialization Android does
 at boot, so `GK_ENROLL` succeeds → mint a HAT → trusted `gfber` ENROLL(1007) → template →
 `AUTHENTICATE`(1010). "Correct" and PIN-bound, but it's bootloader/TZ work with an uncertain exact
