@@ -62,38 +62,69 @@ On pmOS, lk2nd chainloads Linux and none of the keystore/vold/gatekeeperd initia
 The input-independent `VERIFICATION_FAILED` is consistent with the **gatekeeper HMAC key never
 being derived/provisioned** because that boot-time setup is absent.
 
-## Decisive update (2026-10-15): keymaster is GLOBALLY unprovisioned — it's the ROT, not just gatekeeper
+## 2026-10-15 deep dive — lk2nd/keymaster commands, the real errors, and the OPEN gatekeeper puzzle
 
-A standard keymaster crypto op was tested from userspace: **`generate_key(0x508)`** (AES-128) →
-**`-40`**, the same rejection as shared-HMAC. So it is **not** gatekeeper-specific — **every keymaster
-operation that creates or derives key material fails** (generate `-40`, configure `-38`, shared-HMAC
-`-40`, gatekeeper enroll `-30`); only the OEM FP-key *read* (`0x205`) works. That is the signature of
-a keymaster whose **Root of Trust / boot-state was never set**. Per Android's own docs, the bootloader
-supplies the ROT + OS version and `configure` checks it on the first boot call — which is exactly what
-fails here.
+**This is the current frontier. It is a well-characterized OPEN problem — a good target for extra eyes
+(other LLMs / GitHub Copilot / pmOS + sdm845 folks). Everything below is reproducible from this repo's
+`/dev/qseecom` shim + driver; the probe scripts are in the project scratchpad (`gkmint.py`, `gkgen*.py`,
+`gkrot.py`, `gkhmac.py`).**
 
-There is **no keymaster *app* command** for the ROT in the vendor HALs (only the `KM_TAG_ROOT_OF_TRUST`
-key tag); the ROT is delivered by a **bootloader SMC**. Therefore:
+### The keymaster command space on this device (keymaster64, app_id 1)
+From lk2nd's `include/km_main.h` (bootloader keymaster) + the vendor HALs:
+`KEYMASTER_CMD_ID=0x100`, `KEYMASTER_UTILS_CMD_ID=0x200`.
 
-- **Halium cannot fix this.** It runs in userspace after boot; the ROT SMC is one-shot and happens
-  before Linux. Running `keystored`/`gatekeeperd` under Halium would still hit the unprovisioned TA.
-- **lk2nd (or the stock ABL path) is the only route.** The fix is to make the boot chain set the
-  keymaster Root-of-Trust / boot-state for the kernel it boots, before handing off.
+| Command | ID | Source |
+|---|---|---|
+| GET_VERSION | `0x200` | lk2nd km_main.h — **works, returns 0** |
+| SET_ROT | `0x201` | lk2nd `boot_verifier.c: send_rot_command` |
+| READ_LK_DEVICE_STATE | `0x202` | lk2nd — **works, returns 0** |
+| SET_BOOT_STATE | `0x208` | lk2nd `boot_verify_send_boot_state` |
+| ADD_RNG_ENTROPY | `0x107` | lk2nd km_main.h |
+| GENERATE_KEY (old) | `0x108` | lk2nd km_main.h |
+| configure | `0x116` | vendor `KeymasterHalDevice::configure` |
+| generate_key (new) | `0x508` | vendor KM3 HAL |
+| GET_HMAC_SHARING_PARAMS / COMPUTE_SHARED_HMAC | `0x706` / `0x707` | vendor KM4 HAL |
+| OEM FP-key get (Goodix) | `0x205` | `libgf_ca get_key_from_keymaster` — **works** |
+| gatekeeper ENROLL / VERIFY | `0x1001` / `0x1002` | vendor gatekeeper@1.0 HAL |
 
-### Concrete lk2nd investigation
-1. Find how the stock **ABL/XBL** sets the keymaster ROT/boot-state on this SoC (the Qualcomm
-   `scm`/`qsee` set-boot-state call, or the SMEM/IMEM region keymaster reads). lk2nd is loaded *by*
-   ABL as the boot image, so determine whether ABL sets the ROT for lk2nd and whether that state is
-   usable by keymaster from Linux, or whether lk2nd must (re-)issue it.
-2. If lk2nd must issue it: add the set-boot-state SMC to lk2nd before it boots Linux, with the
-   verified-boot fields (state, device-locked, VB key hash, boot hash). **Caveat:** the ROT set is
-   typically **one-shot, locked after the first call** — if ABL already set it (even to an
-   unlocked/orange value) the call is closed, and crypto failing anyway would mean the problem is a
-   *value* keymaster rejects, not a missing call. Establish which case this is first.
-3. This is **uncharted for sdm845** (a web search found no solved case) — it is a genuine
-   bootloader/TrustZone project with uncertain feasibility, not a config tweak.
+### Error codes (standard `keymaster_error_t`, confirmed `KM_ERROR_INVALID_TAG = -40` in km_main.h)
+`-1` ROOT_OF_TRUST_ALREADY_SET · `-8` INCOMPATIBLE_BLOCK_MODE · `-15` INVALID_USER_ID ·
+`-30` VERIFICATION_FAILED · `-38` INVALID_ARGUMENT · `-40` INVALID_TAG.
 
-## The route — investigation order
+### What was observed (from the shim, keymaster app_id 1)
+- `GET_VERSION(0x200)` → **0**, `READ_LK_DEVICE_STATE(0x202)` → **0**. So keymaster **responds** and the
+  no-arg util path works. (So the earlier "keymaster is globally unprovisioned" claim is **retracted** —
+  it is not clearly unprovisioned.)
+- Param-based commands fail with *param-shaped* errors regardless of values: `generate_key 0x508` →
+  `-40 INVALID_TAG`; `generate_key 0x108` → `-8` for AES-CBC, AES-ECB, **and HMAC** (HMAC has no block
+  mode, so `-8` here is not literally "block mode" — it points at **our param serialization being
+  wrong**, not the key config). `configure 0x116` → `-38 INVALID_ARGUMENT`.
+  **Open #1: what is the exact keymaster param-set wire format this TA expects?** Our current guess is
+  12-byte entries `{tag(u32), value(u32), pad(u32)}` after a `[cmd, params_off, count]` header (RE'd
+  from `KeymasterHalDevice::params_serialize`). Getting one `generate_key` to return a key blob would
+  prove crypto works and isolate the gatekeeper issue.
+- `SET_ROT(0x201)` from userspace (lk2nd's exact request: `{cmd_id, rot_offset=12, rot_size=32}` +
+  `SHA256(is_unlocked_byte)` for the ORANGE/unlocked path) → `-15 INVALID_USER_ID` (not `-1`
+  ALREADY_SET). `send_rot_command` **is** called in the stock boot path (`app/aboot/aboot.c:2019`).
+  **Open #2: is the ROT already set by ABL (so the gatekeeper issue is elsewhere), or does
+  lk2nd-beryllium skip it?** `-15` (not `-1`) is ambiguous — could be a format/user mismatch or the
+  newer TA rejecting a direct SET_ROT.
+- **The core wall: gatekeeper `ENROLL(0x1001)` → `-30 VERIFICATION_FAILED`, request format verified
+  against `GatekeeperHalDevice::enroll` disasm, identical across every uid/password.** For a first
+  enroll (null current password) nothing should be verified.
+  **Open #3: why does a first gatekeeper enroll fail verification?** Candidates: the gatekeeper↔keymaster
+  auth-token shared key is not established (the KM4 `COMPUTE_SHARED_HMAC 0x707` returns `-40` on this
+  KM3-era TA); or `0x1001` is the wrong gatekeeper command id for this TA generation; or `gatekeeperd`
+  does a boot-time init we have not replicated.
+
+### Does Halium vs lk2nd still apply?
+Undetermined now, because keymaster is **not** cleanly "unprovisioned." If Open #2 shows the ROT is set,
+the fix is likely a **gatekeeper-level init** (reachable by running `gatekeeperd`/`keystore` — i.e. a
+Halium or a replicated command sequence), not a bootloader change. If the ROT is genuinely unset and
+locked, it is lk2nd. **Resolving Open #1 (param format → a working `generate_key`) and Open #2 (ROT
+state) decides which.**
+
+## The route — investigation order (if it is the bootloader after all)
 
 1. **Is the Root of Trust actually set on this boot?** Query keymaster for something ROT-dependent
    (an attestation / `GET_HW_INFO` / a key-gen that binds ROT) and compare pmOS vs a stock-boot
