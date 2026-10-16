@@ -467,11 +467,29 @@ and the config-NoC / interconnect path), which the real **`qce` driver** does bu
 does not. (There is no crypto GDSC to toggle, and pmOS has no `tzdbg`, so the TA's own
 `qsee_open failed` vs `ICrypto_device_kdf failed` message can't be read to split the two.)
 
-**Concrete next step:** bring the CE up properly — enable `CONFIG_CRYPTO_DEV_QCE` and add a
-`crypto@1de0000` node (clocks `GCC_CE1_AXI/AHB/CLK`, reset `GCC_CE1_BCR`, the interconnect, and the CE
-BAM) so the mainline driver powers and resets the engine, then retry `GK_ENROLL`. Alternatively RE the
-import `qsee_open(0xb)` to confirm whether the first failure is the service open (needing a listener)
-rather than the KDF. Either way the lever is **Linux CE bring-up**, no bootloader.
+**Update: the infra is already in-tree, and enabling the correct CE clocks did NOT crack it.**
+`sdm845.dtsi` already has `crypto@1dfa000` (`qcom,crypto-v5.4`, matched by the in-tree `qce` driver,
+which is built in with `QCOM_BAM_DMA` + `INTERCONNECT_QCOM_SDM845`) and `cryptobam@1dc4000`. Two things
+learned:
+1. The node is **`status = "disabled"`** on purpose — its comment: *"FIXME: disabled due to a regression
+   causing a trap to TZ and a hard reset if this device is used."* So the CE is **shared with TZ**;
+   letting the Linux `qce` driver *use* it hard-resets the device. (So we must not just enable the node.)
+2. The crypto node's clocks are `iface=GCC_CE1_AHB_CLK`, `bus=GCC_CE1_AXI_CLK`, **`core=RPMH_CE_CLK`**
+   (an rpmh-managed clock) — my first attempt enabled `gcc_ce1_clk` (not even in the node). Corrected a
+   clocks-only module to `clk_prepare_enable` `GCC_CE1_AHB` + `GCC_CE1_AXI` + `RPMH_CE_CLK` (all three
+   return 0). **`GK_ENROLL` is still `-30`.**
+
+So enabling the CE clocks from Linux — even the right ones, without the driver — does not fix it. Likely
+**TZ clocks the CE itself** (it shares the engine and votes `RPMH_CE_CLK` via its own path), which would
+make the Linux clock-enable moot, and the `-30` is then either `qsee_open(service 0xb)` failing or the
+SHK derivation failing for a reason we can't see. **The TA's own log would say which** (`"qsee_open
+failed"` vs `"ICrypto_device_kdf failed"`), but pmOS has no `tzdbg`/`qcom_tzlog`.
+
+**Decisive next step:** add the TZ log (`CONFIG_QCOM_TZLOG` + the tz-diag DT node, or read the diag
+region) to see the exact TA error, which splits `qsee_open` (a service/availability problem) from the
+KDF (a CE/hardware problem). Secondary: RE the `qsee_open(0xb)` import. The gatekeeper key origin is
+fully mapped (SHK → hardware CE KDF); what remains is *why* that one hardware-crypto call fails, and the
+clock was not it.
 
 ## The route — investigation order (if it is the bootloader after all)
 
