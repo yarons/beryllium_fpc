@@ -414,6 +414,26 @@ remains are two specific, reproducible keymaster/gatekeeper **parameter/format**
 bootloader change. This is a clean, well-bounded target for continued work / crowdsourcing. Path B
 (libfprint image) remains the independent, non-keymaster road to a working unlock.
 
+### gatekeeper enroll `-30` — RE'd to the handle-build crypto (NOT storage/RPMB/listener)
+The enroll handler is `0x13794` (`deserializeEnroll`; gatekeeper cmds `0x1001`/`0x1002` are in the same
+dispatch table at vaddr `0x30000`, handlers `0x13794`/`0x1434c`).
+- Request layout is correct and **parses**: `[0]=cmd`, `[4]=uid`, `[8]/[0xc]=current-handle len/off`,
+  `[0x10]/[0x14]=current-password len/off`, `[0x18]/[0x1c]=new-password off/len`, PIN at `0x20`; for a
+  first enroll the current-handle/password fields are 0 and it takes the first-enroll path.
+- `gk_get_rpmb_data_uid (0x1dcc0)` → `gk_rpmb_init (0x1e428)`: a static flag at vaddr `0x30e40` is **0**
+  (never written in code), so `gk_rpmb_init` returns success with an **empty in-memory table** and
+  **does no RPMB read or write**. So enroll needs no RPMB/secure storage on this device — consistent
+  with the kernel log showing **no listener request** during enroll.
+- The first-enroll path then builds the password handle entirely in crypto (`0x1c374` must return 8;
+  HMACs via `0x1e5e0`/`0xb000`/`0x1e80c`) and the `-30` (`KM_ERROR_VERIFICATION_FAILED`) comes from
+  there. It is **input-independent** (every uid/PIN gives `-30`, session 3).
+- So the `-30` is an **in-TA crypto / self-verification failure building the handle**, not storage,
+  listener, ROT, boot-state, or configure (all satisfied). The leading cause is that the **gatekeeper
+  hardware HMAC / auth-token key** the handle is signed with is not available or not stable on pmOS.
+  This is the precise, bounded remaining sub-problem for the HAT path. (Open: which of `0x1c374` /
+  `0x1e5e0` / `0xb000` returns `-30` and why — i.e. where the gatekeeper key comes from and what
+  establishes it.)
+
 ## The route — investigation order (if it is the bootloader after all)
 
 1. **Is the Root of Trust actually set on this boot?** Query keymaster for something ROT-dependent
