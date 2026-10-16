@@ -455,7 +455,23 @@ or otherwise `clk_prepare_enable` them). Then the TZ SHK-KDF works, enroll succe
 
 **This is the actual root of the keymaster/gatekeeper crypto wall, and it is Linux-side.** Everything
 else (ROT, boot-state, configure, request formats, storage) is satisfied; the one missing piece is the
-hardware crypto clock.
+hardware crypto engine.
+
+#### Test (2026-10-16): gate clocks enabled, `-30` persists → needs full CE bring-up
+Built a small module that `clk_prepare_enable`s the three CE1 clocks via
+`of_clk_get_from_provider(gcc, {9,10,11})` (`GCC_CE1_AHB/AXI/CLK`). After loading it the clocks show
+`enable=1`, `hardware_enable=Y` in `clk_summary` (rate reads 0 — they are top-level bus gates with no
+modelled parent). But `GK_ENROLL` still returns `-30`. So enabling the **gate clocks alone is not
+enough** — the Crypto Engine needs the rest of its bring-up (block-reset deassert via `GCC_CE1_BCR`,
+and the config-NoC / interconnect path), which the real **`qce` driver** does but a bare clock-enable
+does not. (There is no crypto GDSC to toggle, and pmOS has no `tzdbg`, so the TA's own
+`qsee_open failed` vs `ICrypto_device_kdf failed` message can't be read to split the two.)
+
+**Concrete next step:** bring the CE up properly — enable `CONFIG_CRYPTO_DEV_QCE` and add a
+`crypto@1de0000` node (clocks `GCC_CE1_AXI/AHB/CLK`, reset `GCC_CE1_BCR`, the interconnect, and the CE
+BAM) so the mainline driver powers and resets the engine, then retry `GK_ENROLL`. Alternatively RE the
+import `qsee_open(0xb)` to confirm whether the first failure is the service open (needing a listener)
+rather than the KDF. Either way the lever is **Linux CE bring-up**, no bootloader.
 
 ## The route — investigation order (if it is the bootloader after all)
 
