@@ -485,11 +485,23 @@ make the Linux clock-enable moot, and the `-30` is then either `qsee_open(servic
 SHK derivation failing for a reason we can't see. **The TA's own log would say which** (`"qsee_open
 failed"` vs `"ICrypto_device_kdf failed"`), but pmOS has no `tzdbg`/`qcom_tzlog`.
 
-**Decisive next step:** add the TZ log (`CONFIG_QCOM_TZLOG` + the tz-diag DT node, or read the diag
-region) to see the exact TA error, which splits `qsee_open` (a service/availability problem) from the
-KDF (a CE/hardware problem). Secondary: RE the `qsee_open(0xb)` import. The gatekeeper key origin is
-fully mapped (SHK → hardware CE KDF); what remains is *why* that one hardware-crypto call fails, and the
-clock was not it.
+**TZ-log diagnostic built — but production QSEE logging is OFF.** Implemented it: added
+`qcom_scm_qseecom_register_log_buf(phys, len)` (owner `QSEE_OS`, svc 1, cmd 6 = `QSEOS_REGISTER_LOG_BUF`,
+args `[phys, 0x10000]`, via the existing qseecom SMC path) + a `tzlog` module that tzmem-allocs a 64K
+buffer, registers it, and exposes it at `/sys/kernel/debug/qsee_log`. Registration **succeeds**
+(`ret=0`), but TZ writes **nothing** — the buffer stays all-zero (offset 0, wrap 0) across TA loads
+*and* `GK_ENROLL`. So the shipped TZ has TA logging **disabled**; the keymaster/gatekeeper TA's log
+calls produce no output, and we cannot read `qsee_open failed` vs `ICrypto_device_kdf failed` this way.
+
+**Where this leaves the gatekeeper `-30`:** fully *traced* (handle self-verify → gatekeeper key from
+`getGkDerivedKey` → `getDeviceBoundDerivedKey` → the **SHK hardware-CE KDF**), but not *pinpointed* to
+`qsee_open` vs the KDF, because (a) enabling the correct CE clocks from Linux did not fix it (TZ likely
+clocks the shared CE itself), (b) the CE is shared with TZ and mainline disables it to avoid a hard
+reset, and (c) production TZ emits no logs. The three easy diagnostics are now exhausted. Remaining
+options are harder: RE the QSEE `qsee_open(0xb)` service model, or find a way to raise the TZ log level —
+otherwise this is the point to hand the (now very precisely characterized) problem to crowdsourcing.
+**Path B (libfprint image) remains the independent, non-keymaster road to a working unlock** and does
+not depend on any of this.
 
 ## The route — investigation order (if it is the bootloader after all)
 
