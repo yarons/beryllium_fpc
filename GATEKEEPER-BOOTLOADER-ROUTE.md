@@ -345,10 +345,45 @@ Every concrete lever has now been investigated and disproven:
 
 keymaster refuses all key ops (`generate -8`, `configure -38`, `gatekeeper enroll -30`) with ROT + an
 orange boot-state both provisioned by ABL, makes no normal-world callback, and cannot be re-initialised
-from the OS. The remaining state it is gating on is set inside the stock ABL boot and is not reachable or
-safely changeable from pmOS. **Path A is walled** short of replacing the primary bootloader. The
-practical road to a *working* (not PIN-bound) unlock remains **Path B** — the libfprint image path — which
-is independent of all of this and needs on-sensor capture work, not keymaster.
+from the OS. **At the time this looked like Path A was walled — but session 7 (below) shows that is
+wrong for `generate`.**
+
+## 2026-10-16 session 7 — `generate`'s `-8` is POST-PARSE semantic validation, NOT a wall. Path A reopens as a param/config problem.
+
+RE of the keymaster TA itself (re-dumped `keymaster_a`, capstone) traced the `generate (0x108)` path end
+to end, via the TA's own **dispatch table** at vaddr `0x30000` (`cmd 0x108 → handler 0xfa8`):
+
+- The generate handler first calls the param parser **`deserializeGenKey` (0x409c)**. That parser
+  **confirms the 12-byte record format is exactly right**: it reads `params_off` at `[req+4]`, `count`
+  at `[req+8]`, and checks `(reqlen - params_off) / 12 == count` — returning `-21` only on a length
+  mismatch. For our `[cmd][0x0c][count] + N×12B` requests it **succeeds**.
+- `generate` then runs semantic validation and returns `-8` from a **`blockModeValid`** check
+  (`INCOMPATIBLE_BLOCK_MODE`): it requires the parsed block mode (`struct[0x1e4]`) to be present in a
+  parsed array (`struct[0x48]`, count `struct[0x60]`). The `-8` is reached **only after a successful
+  parse**.
+
+**So keymaster is NOT provisioning/boot-state/storage-walled for `generate`.** It parses our params and
+runs crypto-parameter validation — i.e. the TA is operational from pmOS; the `-8` is a **key-config
+error**, not an unreachable state. This **overturns the earlier "walled" verdict** for the generate
+path (sessions 3–6 killed the *bootloader/listener* theories; they were answering the wrong question).
+
+### What this means for Path A
+- The blocker is now a **tractable param/config problem**, not a bootloader one: find the key
+  description that passes `blockModeValid` (and the later checks) so `generate_key` returns a blob. That
+  proves keymaster crypto works from pmOS and makes it very likely the gatekeeper `enroll -30` is
+  *also* a config/format issue, not a wall.
+- **The QSEE-listener route (session 3/5) is likely moot for this** — `generate` fails at param
+  validation, long before any storage/listener callback, which is consistent with "no `0xee02` ever
+  seen". The listener framework stays as infra but is not the lever here.
+- Open sub-problem (good for crowdsourcing / an on-device sweep): the exact tag set feeding
+  `struct[0x48]` (the allowed-block-mode array) vs `struct[0x1e4]` (the block mode checked), and whether
+  the TA leaves the `0x460` key-context struct partially uninitialised so stray fields trip the check —
+  which would explain why even a plausibly-valid AES config still returns `-8`.
+
+**Revised status:** Path A is *not* walled — it is an unresolved keymaster **key-parameter** problem,
+reachable and testable entirely from pmOS (via the `/dev/qseecom` shim on the listener/shim kernel). The
+next concrete step is an on-device sweep of key configurations to get one `generate_key` to succeed.
+Path B (libfprint image) remains the independent, non-keymaster road to a working unlock.
 
 ## The route — investigation order (if it is the bootloader after all)
 
