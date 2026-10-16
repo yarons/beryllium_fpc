@@ -381,9 +381,38 @@ path (sessions 3–6 killed the *bootloader/listener* theories; they were answer
   which would explain why even a plausibly-valid AES config still returns `-8`.
 
 **Revised status:** Path A is *not* walled — it is an unresolved keymaster **key-parameter** problem,
-reachable and testable entirely from pmOS (via the `/dev/qseecom` shim on the listener/shim kernel). The
-next concrete step is an on-device sweep of key configurations to get one `generate_key` to succeed.
-Path B (libfprint image) remains the independent, non-keymaster road to a working unlock.
+reachable and testable entirely from pmOS (via the `/dev/qseecom` shim on the listener/shim kernel).
+
+### CONFIGURE CRACKED — keymaster is operational from pmOS (proof it is not walled)
+RE of `deserializeConfigure` (configure's worker `0x7bd4`) showed configure **requires `OS_VERSION` and
+`OS_PATCHLEVEL` to match the boot values ABL programmed** (strings: *"The System Version in BOOT Image
+does not match ... Please ensure Boot And System image with [the same version]"*; `-38` on mismatch,
+`-40` on an unexpected tag). The installed `boot` image's `os_version` header field (offset 0x2c) is `0`,
+which decodes to os_version `0` and **os_patchlevel `200000`** (year-2000 / month-0). On-device sweep:
+
+```
+configure(os_version=0, os_patchlevel=200000)  ->  0   (SUCCESS)
+```
+
+**`configure` succeeds from pmOS.** That is direct proof keymaster parses, validates *and* accepts
+configuration from the OS — there is no provisioning/boot-state/storage wall. (Earlier `configure(0,0)`
+failed only because the patchlevel had to be `200000`, not `0`.)
+
+### Remaining: two distinct, in-TA param/format validations (no listener, no wall)
+With configure done:
+- **`generate 0x108` → `-8`** still, for *every* algorithm incl. HMAC/EC/RSA (which have no block mode).
+  It is a key-parameter validation (`blockModeValid`: parsed `struct[0x1e4]` must be in parsed array
+  `struct[0x48]`) that our configs don't satisfy — likely a tag-serialization / struct-init detail, not
+  a wall.
+- **`gatekeeper enroll 0x1001` → `-30`** still, even after configure, and **makes no listener call**
+  (`resp_type` stays `APP_ID`, never `0xee02`). So its `-30` is an in-TA validation too, not an RPMB
+  callback — a gatekeeper request-format / precondition problem, independent of generate.
+
+**Verdict (session 7):** Path A is **reachable and operational from pmOS** — keymaster configures. What
+remains are two specific, reproducible keymaster/gatekeeper **parameter/format** problems
+(`generate -8`, `gatekeeper-enroll -30`), each crackable from pmOS with the `/dev/qseecom` shim and no
+bootloader change. This is a clean, well-bounded target for continued work / crowdsourcing. Path B
+(libfprint image) remains the independent, non-keymaster road to a working unlock.
 
 ## The route — investigation order (if it is the bootloader after all)
 
