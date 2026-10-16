@@ -434,6 +434,29 @@ dispatch table at vaddr `0x30000`, handlers `0x13794`/`0x1434c`).
   `0x1e5e0` / `0xb000` returns `-30` and why — i.e. where the gatekeeper key comes from and what
   establishes it.)
 
+### ROOT CAUSE of the `-30`: the hardware Crypto Engine is unclocked on pmOS
+Tracing the gatekeeper key: enroll builds the handle then **self-verifies** it (the `-30` sites are in
+`verify_password`). The handle is HMAC'd with a key from `getGkDerivedKey (0xb000)` →
+`getDeviceBoundDerivedKey (0xb160)` → the KDF `0x1ea8c`, whose label is **"GK HMAC HW Crypto key
+derived from SHK"**. That KDF does `qsee_open(service 0xb)` then **`ICrypto_device_kdf`** — a **hardware
+Crypto Engine (CE)** operation reading the **SHK (Secure Hardware Key)**. Its failure strings are
+*"qsee_open failed"* / *"ICrypto_device_kdf failed"*.
+
+On-device, the CE is **off**: `gcc_ce1_clk`, `gcc_ce1_axi_clk`, `gcc_ce1_ahb_clk` all have
+`enable_count = 0`, `rate = 0`; there is no `qce`/`qcedev` driver and no crypto node in the pmOS device
+tree. So TZ's `ICrypto_device_kdf` cannot run → the gatekeeper key cannot be derived → the handle's
+self-verify fails → **enroll `-30`**. (This same unclocked CE is why generate's crypto would fail too,
+though generate stops earlier at `blockModeValid`.)
+
+**The fix is ordinary Linux bring-up, no bootloader:** power the Crypto Engine from pmOS — enable
+`GCC_CE1_CLK` / `GCC_CE1_AXI_CLK` / `GCC_CE1_AHB_CLK` (add a `crypto@1de0000` DT node + the `qce` driver,
+or otherwise `clk_prepare_enable` them). Then the TZ SHK-KDF works, enroll succeeds → HAT →
+`gfber ENROLL(1007)` → `AUTHENTICATE(1010)` → libfprint/PAM.
+
+**This is the actual root of the keymaster/gatekeeper crypto wall, and it is Linux-side.** Everything
+else (ROT, boot-state, configure, request formats, storage) is satisfied; the one missing piece is the
+hardware crypto clock.
+
 ## The route — investigation order (if it is the bootloader after all)
 
 1. **Is the Root of Trust actually set on this boot?** Query keymaster for something ROT-dependent
