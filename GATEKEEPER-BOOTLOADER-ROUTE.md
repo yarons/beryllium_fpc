@@ -311,12 +311,44 @@ in the shim's firmware format).
 keymaster stays down until a **cold boot** (power cycle), which re-runs XBL and reloads it. (Normal pmOS
 use is unaffected — nothing on pmOS uses keymaster.)
 
-**Verdict:** the lever for Path A is **lk2nd / the bootloader**, not a Linux listener or userspace. The
-listener framework is kept as correct, necessary infrastructure (it will still be needed once the TA is
-provisioned at boot and reaches RPMB), but it is not where the fix is. Next concrete lead: have lk2nd
-send the keymaster **boot-state SMC** (`SET_BOOT_STATE 0x208`, the step pmOS/lk2nd currently skips;
-`-15 INVALID_USER_ID` from userspace confirms it is bootloader-only) so the TA leaves its
-unprovisioned-boot state and stops refusing key ops before storage.
+**Verdict (as of this test):** the lever for Path A looked like **lk2nd / the bootloader**, not a Linux
+listener. The listener framework is kept as correct, necessary infrastructure, but it is not the fix.
+Next lead at the time: have the bootloader send the keymaster **boot-state SMC** (`SET_BOOT_STATE 0x208`).
+
+## 2026-10-16 session 6 — the lk2nd boot-state lead is MOOT: lk2nd isn't in the boot chain, and ABL already sends boot-state
+
+Investigated the `SET_BOOT_STATE` route and it collapses:
+- **lk2nd is not in this device's boot chain.** The `boot` partition is a plain `ANDROID!` image (the pmOS
+  kernel + ramdisk, pmOS cmdline), and `abl_a` is Qualcomm's ELF ABL. No `lk2nd` string anywhere in
+  `boot`. So the chain is **XBL → stock Qualcomm ABL → the pmOS kernel directly** — there is no lk2nd to
+  modify. (lk2nd was compiled earlier but never flashed.)
+- **Stock ABL already provisions keymaster.** Production Qualcomm ABL sends *both* `SET_ROT` and
+  `SET_BOOT_STATE`; `SET_ROT` is confirmed (`0x20c → ALREADY_SET`) and the kernel cmdline carries ABL's
+  `androidboot.verifiedbootstate=orange`, `androidboot.keymaster=1`, `androidboot.secureboot=1`. So
+  boot-state is **not** missing — it is set to **orange** (unlocked).
+- In lk2nd's own source the `SET_BOOT_STATE` send is build-gated by `#if OSVERSION_IN_BOOTIMAGE`, and the
+  cmdline `verifiedbootstate=` string is *separate* from the keymaster SMC — but none of that matters
+  here because lk2nd is not the bootloader in use.
+
+So "have lk2nd send `SET_BOOT_STATE`" cannot be the fix: boot-state is already sent, by stock ABL. The
+only bootloader-level lever left would be to **replace stock ABL (`abl_a`) with a modified bootloader
+that feeds keymaster a *green/locked* boot-state** — which (a) is unproven to help (unlocked/orange
+Android phones still use keymaster-backed fingerprint), and (b) means flashing the **primary**
+bootloader, i.e. real hard-brick / EDL-recovery risk. Not a reasonable step.
+
+### Honest Path A status
+Every concrete lever has now been investigated and disproven:
+- **Linux QSEE listener** — built and booted, but keymaster makes no listener call (session 5).
+- **Force TA re-init from Linux** — keymaster is a reserved bootloader-PIL TA, not runtime-reloadable
+  (`LOAD → -EINVAL`) (session 5).
+- **lk2nd `SET_BOOT_STATE`** — lk2nd not in the boot chain; boot-state already set by ABL (this session).
+
+keymaster refuses all key ops (`generate -8`, `configure -38`, `gatekeeper enroll -30`) with ROT + an
+orange boot-state both provisioned by ABL, makes no normal-world callback, and cannot be re-initialised
+from the OS. The remaining state it is gating on is set inside the stock ABL boot and is not reachable or
+safely changeable from pmOS. **Path A is walled** short of replacing the primary bootloader. The
+practical road to a *working* (not PIN-bound) unlock remains **Path B** — the libfprint image path — which
+is independent of all of this and needs on-sensor capture work, not keymaster.
 
 ## The route — investigation order (if it is the bootloader after all)
 
